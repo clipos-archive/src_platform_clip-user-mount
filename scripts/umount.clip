@@ -1,0 +1,204 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/umount.clip - unmount all temporary mountings in a given jail, based
+# on that jail's mtab. Processes still using the temporary mountings are killed
+# as needed.
+# Copyright (C) 2007 SGDN/DCSSI
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+source "/lib/clip/usermount.sub" || exit 1
+
+function init() {
+	SOURCE=""
+	DEST=""
+	ADMIN_DEST=""
+	DMDEVICE=""
+}
+
+function cleanup() {
+	warn "exiting on error"
+}
+
+function read_mtab() {
+	local line="${1}"
+
+	if [[ -z "${line}" ]]; then
+		# Not an error per se, but not expected
+		warn "read_mtab: empty line ?"
+		return 0
+	fi
+	local -a array=( ${line} )
+
+	SOURCE="${array[0]}"
+	DEST="${array[1]}"
+	EXTRA="${array[4]}"
+
+	[[ -z "${SOURCE}" ]] && \
+		error "read_mtab: cannot find mount's source: ${line}"
+	[[ -z "${DEST}" ]] && \
+		error "read_mtab: cannot find mount's target: ${line}"
+
+	if [[ "${EXTRA/crypt/}" != "${EXTRA}" ]]; then 
+		DMDEVICE="${SOURCE}"
+	else
+		DMDEVICE=""
+	fi
+}
+
+function kill_mount_jail() {
+	local mnt="${1}"
+	local sig="${2}"
+	local jail="${3}"
+	[[ -z "${jail}" ]] \
+		&& error "kill_mount_jail: insufficient arguments"
+
+	local exe="${BB_FUSER}"
+	# There is no busybox in USERclip, but fuser is available
+	[[ "${jail}" == "user" ]] && exe="${FUSER}"
+
+	vsctl -d "${jail}" enter -- ${exe} -km "-${sig}" "${mnt}"
+
+	# Kill zombies - one bullet to the head ought to do the trick
+	if [[ "${jail}" != "user" ]]; then
+		local zombies="$(vsctl "${jail}" enter -- ${BB_PS} | awk '$4 == "Z" {print $1}')"
+		if [[ -n "${zombies}" ]]; then 
+			vsctl -d "${jail}" enter -- ${BB_KILL} -9 ${zombies}
+		fi
+	fi
+}
+
+function umount_ctx() {
+	nsmount -m "${MTAB_FILE}" -x "${XID}" -u "${DEST}" && return 0
+
+	# Try once to do it the polite way...
+	kill_mount_jail "${DEST}" 15 "${LEVEL}"
+	sleep 1
+	nsmount -m "${MTAB_FILE}" -x "${XID}" -u "${DEST}" && return 0
+
+	# ... then start being outright rude
+	warn "Trying kill -9 users of ${DEST} in ${LEVEL}"
+	kill_mount_jail "${DEST}" 9 "${LEVEL}"
+	sleep 1
+	nsmount -m "${MTAB_FILE}" -x "${XID}" -u "${DEST}"  && return 0
+
+	warn "failed to umount ${DEST} in ${LEVEL}"
+	return 1
+}
+
+function kill_mount_clip() {
+	local mnt="${1}"
+	local sig="${2}"
+	[[ -z "${sig}" ]] \
+		&& error "kill_mount_clip: insufficient arguments"
+
+	fuser -km "-${sig}" "${mnt}"
+}
+
+function umount_clip() {
+	local mnt=$(awk -vpat="${DEST}" \
+				'{ if ($2 == pat) print }' "/proc/mounts")
+
+	# running fuser -km on an unexpected mount point, typically /, would
+	# be kinda messy...
+	if [[ -z "${mnt}" ]] ; then
+		warn "${DEST} does not seem to be mounted in main ns"
+		return 0
+	fi
+
+	umount "${DEST}" && return 0
+
+	# Try once to do it the polite way...
+	kill_mount_clip "${DEST}" 15 
+	${SLEEP} 1
+	umount "${DEST}" && return 0
+
+	# ... then start being outright rude
+	warn "Trying kill -9 users of ${DEST} in ${LEVEL}"
+	kill_mount_clip "${DEST}" 9 "${LEVEL}"
+	${SLEEP} 1
+	umount "${DEST}" && return 0
+
+	warn "failed to umount ${DEST} in ${LEVEL}"
+	return 1
+}
+
+function umount_all() {
+	local line="${1}"
+	local -i ret=0
+	if [[ "${LEVEL}" == "clip" ]]; then
+		umount_clip || ret=1
+		if [[ $ret -eq 0 ]]; then
+			remove_mtab_line "${line}" || ret=1
+		fi
+	else
+		umount_ctx || ret=1
+	fi
+	cleanup_device_mapper "${DMDEVICE}" || ret=1
+	return ${ret}
+}
+
+function dec_usb_status() {
+	local line="${1}"
+	if echo "${line}" | grep -q "/mnt/usb"; then
+		warn "unmounted leftover USB token in ${LEVEL}"
+		(
+		flock -s 200
+		local level="$(head -n 1 "${USB_STATUS}" | cut -f2 -d' ')"
+		[[ -z "${level}" ]] && level=0
+		if [[ ${level} -gt 1 ]]; then
+			level=0
+		else 
+			let "level-=1"
+		fi
+		echo "level: ${level}" > "${USB_STATUS}"
+		) 200>>"${USB_STATUS}"
+	fi
+
+}
+
+function remove_mtab_line() {
+	local line="${1}"
+	if [[ -z "${line}" ]]; then
+		warn "remove_mtab_line: empty line ?"
+		return 1
+	fi
+	local sline=$(echo "${line}" | sed -e 's:/:\\/:g')
+	flock "${MTAB_FILE}" \
+		sed -i -e "/^${sline}/d" "${MTAB_FILE}" \
+		|| warn "failed to delete line ${line} from ${MTAB_FILE}"
+}
+
+LEVEL="${1}"
+LINE="dummy"
+common_init
+MTAB_FILE="${MTAB_PATH}/${LEVEL}.mtab"
+get_xid "${LEVEL}"
+
+[[ -f "${MTAB_FILE}" ]] || exit 0
+
+for i in 1 2 3 4; do
+	tac "${MTAB_FILE}" | while read line; do
+		if [[ -z "${line}" ]] ; then
+			warn "empty line?"
+			continue
+		fi
+		init
+		read_mtab "${line}"
+		umount_all "${line}"
+		RETVAL=$?
+		if [[ ${RETVAL} -eq 0 ]]; then
+			log "unmounted ${DEST} in ${LEVEL} on try $i"
+			dec_usb_status "${line}"
+		else
+			warn "could not umount ${DEST} in ${LEVEL}, try $i (RETVAL : ${RETVAL})"
+		fi
+	done
+	[[ "$(wc -l "${MTAB_FILE}" | cut -d ' ' -f 1)" == "0" ]] && exit 0
+	sleep 1
+done
+exit $RETVAL

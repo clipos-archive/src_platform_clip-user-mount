@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/mount.rm - wrapper script for both mounting and unmounting 
+# per-user volumes at session opening and closing within RM jails.
+# Copyright (C) 2011 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License version
+# 2 as published by the Free Software Foundation.
+
+source "/etc/conf.d/clip"
+
+do_mount() {
+	for jail in ${CLIP_JAILS}; do
+		if [[ -x "/vservers/${jail}/update_priv/usr_local/bin/mount.rm" ]]; then
+			vsctl ${jail} enter -c /user -- /usr/local/bin/mount.rm "mount" \
+				||  logger -p local0.err "Failed to run mount.rm in ${jail}"
+		fi
+	done
+}
+
+do_umount() {
+	local uid="$(id -u "${USER}")"
+	local gid="$(id -g "${USER}")"
+	if [[ -z "${uid}" || -z "${gid}" ]]; then
+		logger -p local0.err "Could not get uid for ${USER}"
+		exit 1
+	fi
+
+	for jail in ${CLIP_JAILS}; do
+		if [[ -x "/vservers/${jail}/update_priv/usr_local/bin/mount.rm" ]]; then
+			logger -p local0.info "Running mount.rm in ${jail} for ${USER} : ${uid} / ${gid}"
+			vsctl ${jail} enter -u "${uid}" -g "${gid}" -c /user -- /usr/local/bin/mount.rm "umount" \
+				||  logger -p local0.err "Failed to run mount.rm in ${jail}"
+		fi
+	done
+}
+
+case "${1}" in
+	mount)
+		do_mount
+		;;
+	umount)
+		do_umount
+		;;
+	*)
+		logger -p local0.err "mount.rm: invalid command ${1}"
+		;;
+esac

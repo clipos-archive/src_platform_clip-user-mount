@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# usermount.sub - common code for CLIP's per-user mounts scripts.
+# Copyright (C) 2007 SGDN/DCSSI
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+# Commands
+BB_FUSER="/bin/busybox fuser"
+BB_KILL="/bin/busybox kill"
+BB_PS="/bin/busybox ps"
+
+# Constants
+declare -i MAX_LOOPDEV=7
+DM_PATH="/dev/mapper"
+CTX_FILE="/etc/contexts"
+MTAB_PATH="/var/run"
+JAIL_CONF_BASE="/etc/jails"
+USB_STATUS="/usr/local/var/usb_status"
+
+USE_SYSLOG="yes"
+
+function warn() {
+	local msg="${PROGNAME}: ${1}"
+	if [[ -n "${USE_SYSLOG}" ]] ; then
+		logger -p local0.warning "${msg}"
+	else 
+		echo "${msg}" >&2
+	fi
+}
+
+function log() {
+	local msg="${PROGNAME}: ${1}"
+	if [[ -n "${USE_SYSLOG}" ]] ; then
+		logger -p local0.info "${msg}"
+	else 
+		echo "${msg}"
+	fi
+}
+
+function error() {
+	local msg="${PROGNAME}: ${1}"
+	if [[ -n "${USE_SYSLOG}" ]] ; then
+		logger -p local0.err "${msg}"
+	else 
+		echo "${msg}" >&2
+	fi
+	cleanup
+	exit 1
+}
+	
+function rev_lines() {
+        tac "${1}"
+}
+
+function common_init() {
+	PROGNAME="${0##*/}"
+	[[ -z "${USER}" ]] && error "USER is not defined"
+	[[ -z "${LEVEL}" ]] && error "level is not defined"
+	[[ -z "${LINE}" ]] && error "line is not defined"
+	if [[ -n "${1}" ]]; then
+		[[ -z "${PASSWD}" ]] && error "PASSWD is not defined"
+	fi
+}
+
+function get_xid() {
+	local jail="${1}"
+	[[ "${jail}" == "clip" ]] && return 0
+	XID="$(< "/etc/jails/${jail}/context")"
+	[[ -z "${XID}" ]] && error "cannot find xid for jail ${jail}"
+}
+
+function cleanup_device_mapper() {
+	local device="${1}"
+	[[ -z "${device}" ]] && return 0
+	local bn="${device##*/}"
+
+	local src_dev="$(cryptsetup status "${bn}" \
+				| sed -n '/device/s/[ ]*device:[ ]*//p')"
+	[[ -z "${src_dev}" ]] \
+		&& error "cannot find source device for ${device}"
+
+	cryptsetup remove "${bn}" \
+		|| error "cryptsetup remove ${device} failed"
+
+	if [[ "${src_dev#/dev/loop}" != "${src_dev}" ]]; then
+		losetup -d "${src_dev}" \
+			|| error "losetup -d ${src_dev} (${device}) failed"
+	fi
+}
+
+function do_mkdir() {
+	if [[ "${LEVEL}" == "clip" ]]; then
+		mkdir -p "${DEST}" \
+				|| error "mkdir ${DEST} failed"
+	else
+		vsctl "${LEVEL}" enter -- /bin/mkdir -p "${DEST}" \
+				|| error "mkdir ${DEST} failed"
+	fi
+}

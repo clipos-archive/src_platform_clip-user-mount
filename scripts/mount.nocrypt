@@ -1,0 +1,79 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/mount.nocrypt - perform a mount in a specific jail,
+# without encryption, and update that jail's temporary mountings mtab.
+# Copyright (C) 2008 SGDN/DCSSI
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+source "/lib/clip/usermount.sub" || exit 1
+
+function init() {
+	SRC=""
+	DEST=""
+	OPTS=""
+	DO_MKDIR=""
+}
+
+function cleanup() {
+	warn "exiting on error"
+}
+
+# fstab line format
+# (<level>: ) <src(expand)> <dst(expand)> <opts> <mkdir> <use_ns>
+function read_fstab() {
+	local line="${1//&/${USER}}"
+	if [[ -z "${line}" ]] ; then
+		error "read_fstab: empty line?"
+	fi
+	local -a array=( ${line} )
+	SRC="${array[0]}"
+	DEST="${array[1]}"
+	OPTS="${array[2]}"
+	DO_MKDIR="${array[3]}"
+	[[ -z "${SRC}" ]] && error "read_fstab: missing a source"
+	[[ -z "${DEST}" ]] && error "read_fstab: missing a destination"
+	[[ -z "${OPTS}" ]] && error "read_fstab: missing options"
+
+	case "${TYPE}" in
+		"ext2"|"ext4"|"ext2,ext4"|"tmpfs"|"none")
+			;;
+		*)
+			error "unsupported type: ${TYPE}"
+			;;
+	esac
+}
+
+function do_mount() {
+	[[ "${DO_MKDIR}" == "1" ]] && do_mkdir
+	local mtabfile="${MTAB_PATH}/${LEVEL}.mtab"
+	if [[ "${LEVEL}" == "clip" ]]; then
+		mount -n -t "${TYPE}" -o "${OPTS}" "${SRC}" "${DEST}" \
+			|| error "mount -n -t ${TYPE} -o ${OPTS} ${SRC} ${DEST} failed"
+		# argh, we cannot specify an alternate mtab for mount... 
+		# We will need to do the update in a non-atomic way...
+		local mtabstr="${SRC} ${DEST} ${TYPE} ${OPTS}"
+		flock "${mtabfile}" echo "${mtabstr}" >> "${mtabfile}"
+	else
+		nsmount -m "${mtabfile}" -x "${XID}" -o "${OPTS}" \
+				-t "${TYPE}" "${SRC}" "${DEST}" \
+			|| error "nsmount failed"
+	fi
+}
+		
+
+TYPE="${1}"
+LEVEL="${2}"
+LINE="${3}"
+common_init 
+get_xid "${LEVEL}"
+
+init
+read_fstab "${LINE}"
+do_mount
+log "mounted ${DEST} in ${LEVEL}"
+	

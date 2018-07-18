@@ -1,0 +1,166 @@
+#!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/mount.clip - wrapper script for both mounting and unmounting 
+# per-user volumes at session opening and closing.
+# Copyright (C) 2007 SGDN/DCSSI
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+
+source "/lib/clip/import.sub"
+
+SMARTCARDS_ADMIN_CONF_FILE="/etc/admin/conf.d/smartcards"
+
+import_conf_noerr "${SMARTCARDS_ADMIN_CONF_FILE}" '^[- _a-zA-Z0-9]*' PKCS11_DISK_LABEL 2> /dev/null
+
+source "/lib/clip/usermount.sub"
+
+source "/etc/conf.d/clip"
+
+JAILS="user admin audit ${CLIP_JAILS} clip"
+CONFIG_FILE="/etc/fstab.session"
+
+P11LIB="/usr/lib/p11proxy.so"
+MASTERKEY_FILE="/home/keys/${USER}.masterkey"
+MASTERKEY=""
+PKAUTH=""
+
+function rev_words() {
+	local -i i
+	for (( i = ${#@}; i > 1; i-- )); do
+		echo -n "${!i} " 
+	done
+	echo -n "${1}"
+}
+
+function p11_decrypt_masterkey() {
+	MASTERKEY="$(DISKPIN="${PASSWD}" ckiutl \
+                     -P DISKPIN -m ${P11LIB} -l "${PKCS11_DISK_LABEL}" \
+                     decrypt < ${MASTERKEY_FILE})"
+	if [[ $? -ne 0 ]]; then
+	    _warn "mount.clip: ckiutl call failed while decrypting master key"
+	    return 1
+	fi
+}
+
+function cleanup() {
+	local jail
+	for jail in ${JAILS}; do
+		umount.clip "${jail}"
+	done
+}
+
+function skip_level() {
+	local jail="${1}"
+	[[ -z "${CLIP_ONLY}" ]] && return 1
+
+	case "${jail}" in
+		"clip"|"admin"|"audit"|"update"|"user"|"x11"|"clip")
+			return 1
+			;;
+		*)
+			return 0
+			;;
+	esac
+}
+
+function do_one_mount() {
+	local linenum="${1}"
+	local jail="${2}"
+
+	local -a line=( ${3} )
+	local _type="${line[0]}"
+	local _jail="${line[1]}"
+	# Is it weird if I say I love bash arrays almost as much as perl ?
+	local _line="${line[*]:2}" 
+	if [[ -z "${_line}" ]]; then
+		warn "Empty line at ${CONFIG_FILE}(${linenum})"
+		return 0
+	fi
+
+	if [[ "${jail#rm_}" != "${jail}" ]]; then	# RM JAIL
+		_jail="${_jail//rm_X/${jail}}"
+		_line="${_line//rm_X/${jail}}"
+	fi
+	[[ "${jail}" == "${_jail}" ]] || return 0
+
+	case "${_type}" in
+		"crypt")
+			PKAUTH="${PKAUTH}" MASTERKEY="${MASTERKEY}" \
+				mount.crypt "${jail}" "${_line}" \
+				|| error "failure running mount.crypt for ${jail}"
+			;;
+		"tmpfs"|"none"|"ext2"|"ext4"|"ext2,ext4")
+			mount.nocrypt "${_type}" "${jail}" "${_line}"\
+				|| error "failure running mount.nocrypt for ${jail}"
+			;;
+		*)
+			error "unsupported mount type ${_type}"
+			;;
+	esac
+}
+
+function do_mounts() {
+	if [[ -n ${PKAUTH} ]] ; then
+	    if [[ -z "${MASTERKEY}" ]] ; then
+		p11_decrypt_masterkey
+	    fi
+	fi
+
+	local jail
+	for jail in ${JAILS}; do 
+		local mounted=$(< "${MTAB_PATH}/${jail}.mtab")
+		if [[ -n "${mounted}" ]]; then
+			mount.clip umount
+			mounted=$(< "${MTAB_PATH}/${jail}.mtab")
+			[[ -z "${mounted}" ]] || error "Leftover mounts for ${jail}, aborting"
+		fi
+		if skip_level "${jail}"; then
+			return 0
+		fi
+		local num=1
+		cat "${CONFIG_FILE}" | while read line ; do
+			do_one_mount "${num}" "${jail}" "${line//:/ }"
+			let "num+=1"
+		done
+	done
+}
+
+function do_umounts() {
+	# try to umount as much as we can, and then give a global error status
+	local -i ret=0
+	local jail
+	for jail in $(rev_words ${JAILS}); do
+		umount.clip "${jail}" || ret=1
+	done
+	exit $ret
+}
+
+declare -a GRPS=( $(groups "${USER}") )
+for GRP in "${GRPS[@]}"; do
+	case "${GRP}" in 
+		core_admin|core_audit)
+			CLIP_ONLY="y"
+			;;
+		pkauth)
+			PKAUTH="y"
+			;;
+	esac
+done
+
+case "${1}" in 
+	"mount")
+		do_mounts
+		;;
+	"umount")
+		do_umounts
+		;;
+	*)
+		error "unsupported argument: ${1}."
+		;;
+esac
+

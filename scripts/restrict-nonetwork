@@ -1,0 +1,29 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/restrict-nonetwork - script forbidding the connexion of a
+# non-admin non-audit user in no-network mode 
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2014 SGDSN/ANSSI
+# Authors: 
+#   Olivier Levillain <clipos@ssi.gouv.fr>
+#   Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+[[ -f /var/run/nonetwork ]] || exit 0
+
+source "/lib/clip/misc.sub" || exit 1
+
+TYPE="$(get_user_type "${USER}")"
+
+case "${TYPE}" in 
+	privuser|nomad|admin|audit)
+		exit 0
+		;;
+	*)
+		logger -p auth.err "Blocked login from user ${USER} because no network was found"
+		exit 1
+		;;
+esac

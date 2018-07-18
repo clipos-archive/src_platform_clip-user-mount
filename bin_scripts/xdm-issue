@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+XDIALOG="/usr/local/bin/Xdialog"
+
+ISSUE_FILE="/etc/admin/issue"
+AUTH_DIR="/var/run/authdir/authfiles"
+
+AUTH_FILE="$(ls -rt1 "${AUTH_DIR}" | tail -n 1)"
+XAUTHORITY="${AUTH_DIR}/${AUTH_FILE}"
+
+if ! [[ -s "${ISSUE_FILE}" ]]; then
+	exit 0
+fi
+
+
+export XAUTHORITY
+export LANG=fr_FR
+export LC_ALL=fr_FR
+export DISPLAY=:0
+
+${XDIALOG} --left --ok-label Accepter --cancel-label Refuser --textbox "${ISSUE_FILE}" 0 0
+if [[ $? -ne 0 ]] ; then
+	logger -p local0.warning "${0} : cancelled by user"
+	exit 1
+fi
+exit 0

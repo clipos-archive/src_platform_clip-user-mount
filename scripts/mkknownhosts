@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+[[ -n "${USER}" ]] || exit 1
+
+HOSTS_FILE="/home/user/.ssh/known_hosts"
+
+groups "${USER}" | grep -qe "\<priv_user\>\|\<core_admin\>\|\<core_audit\>" || exit 0
+
+vsctl user enter -- /bin/mkdir "/home/user/.ssh"
+vsctl user enter -- /bin/rm -f "${HOSTS_FILE}" \
+	|| logger -p auth.warning "mkknownhosts: Failed to remove known_hosts file for user ${USER}"
+vsctl user enter -- /bin/ln -s "/etc/known_hosts" "${HOSTS_FILE}" \
+	|| logger -p auth.warning "mkknownhosts: Failed to create known_hosts file for user ${USER}"
+

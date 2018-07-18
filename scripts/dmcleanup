@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/dmcleanup - cleanup any leftover dm-crypt mappings on session exit.
+# NB : those mappings are supposed to be already unmounted, e.g. by a call to
+# umount.clip
+# Copyright 2007 SGDN/DCSSI
+# Copyright 2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+source "/lib/clip/usermount.sub" || exit 1
+
+PROGNAME="${0##*/}"
+
+function cleanup() {
+	warn "exiting on error"
+}
+
+function try_cleanup() {
+	local bn="${1}"
+
+	if cryptsetup status "${bn}" | grep -q "is active:"; then
+		local dev="$(cryptsetup status "${bn}" | awk '$1 == "device:" {print $2}')"
+		if [[ "${dev/loop/}" != "${dev}" ]]; then
+			log "Cleaning up active dm-crypt mapping ${bn}"
+			cleanup_device_mapper "${DM_PATH}/${bn}" 
+		fi
+	else
+		# Do not bail out if this fails, simply output a warning
+		log "Removing inactive dm-crypt device ${bn}"
+		rm -f "${DM_PATH}/${bn}" || warn "Could not remove ${DM_PATH}/${bn}"
+	fi
+}
+ 
+
+for file in "${DM_PATH}"/*; do
+	bn="${file##*/}"
+	case "${bn}" in
+		control|swap0)
+			continue
+			;;
+		*)
+			try_cleanup "${bn}" 
+			;;
+	esac
+done
+		

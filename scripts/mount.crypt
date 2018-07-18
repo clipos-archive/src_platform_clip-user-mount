@@ -1,0 +1,207 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# /sbin/mount.crypt - mount a file-backed encrypted file system in 
+# a specific jail (or in the main namespace)
+# and update that jail's temporary mountings mtab.
+# Copyright (C) 2007-2008 SGDN/DCSSI
+# Copyright (C) 2010-2011 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+
+XDIALOG="/usr/local/bin/Xdialog"
+
+source "/lib/clip/usermount.sub" || exit 1
+source "/lib/clip/userkeys.sub" || exit 1
+
+function init() {
+	LOSETUP_DONE=""
+	CRYPTSETUP_DONE=""
+	DMCOPY_DONE=""
+	DMCOPY=""
+	DEST=""
+	OPTS=""
+	SETTINGS_FILE=""
+	DO_MKDIR=""
+}
+
+function cleanup() {
+	if [[ -n "${CRYPTSETUP_DONE}" ]]; then
+		cryptsetup remove "${DMDEVICE}" \
+			|| warn "cryptsetup remove ${DMDEVICE} failed"
+	fi
+
+	if [[ -n "${LOSETUP_DONE}" ]]; then
+		losetup -d "${LOOPDEV}"	\
+			|| warn "losetup -d ${LOOPDEV} failed"
+	fi
+
+	if [[ -n "${DMCOPY_DONE}" ]]; then
+		rm -f "${DMCOPY}/${DMDEVICE}" \
+			|| warn "could not remove ${DMCOPY}/${DMDEVICE}"
+	fi
+}
+
+# fstab line format
+# (<level>: )<src(expand)> <key(expand)> <dst(expand)> <opts> <mkdir> <nodmcleanup>
+function read_fstab() {
+	local line="${1//&/${USER}}"
+	if [[ -z "${line}" ]] ; then
+		error "read_fstab: empty line?"
+	fi
+	local -a array=( ${line} )
+
+	SOURCE="${array[0]}"
+	KEY_FILE="${array[1]}"
+	SETTINGS_FILE="${KEY_FILE%.key}.settings"
+	DEST="${array[2]}"
+	OPTS="${array[3]}"
+	DO_MKDIR="${array[4]}"
+
+	[[ -z "${SOURCE}" ]] && error "read_fstab: missing a source"
+	[[ -z "${KEY_FILE}" ]] && error "read_fstab: missing a key file"
+	[[ -z "${DEST}" ]] && error "read_fstab: missing a destination"
+	[[ -z "${OPTS}" ]] && error "read_fstab: missing options"
+}
+
+function decrypt_key() {
+	if [[ -n "${PKAUTH}" ]] ; then
+	    local enc_key_file="${KEY_FILE}.enc"
+	    [[ -f "${enc_key_file}" ]] && KEY="$(p11_master_decrypt_key "${enc_key_file}")"
+	else
+	    KEY="$(output_stage2_key "${SETTINGS_FILE}" "PASSWD" "${KEY_FILE}")"
+	fi
+
+	if [[ $? -ne 0 ]]; then
+		error "decrypt_key: failed to decrypt ${KEY_FILE}"
+	fi
+}
+
+function do_losetup() {
+	local -i idx
+	for (( idx = 0; idx < ${MAX_LOOPDEV}; idx++ )) ; do
+		if losetup "/dev/loop${idx}" "${SOURCE}" 2>/dev/null; then
+			LOOPDEV="/dev/loop${idx}"
+			LOSETUP_DONE="yes"
+			return 0
+		fi
+	done
+	error "do_losetup: could not find a usable loop device"
+}	
+
+function do_cryptsetup() {
+	DMDEVICE="${SOURCE//\//_}"
+	if [[ -e "/dev/mapper/${DMDEVICE}" ]]; then
+		cleanup_device_mapper "/dev/mapper/${DMDEVICE}"
+	fi
+	# TODO: check echo
+	echo -n "${KEY}" | cryptsetup -c "aes-lrw-benbi" -h sha256 \
+				-s 384 create "${DMDEVICE}" "${LOOPDEV}" \
+		|| error "do_cryptsetup: cryptsetup create failed"
+	CRYPTSETUP_DONE="yes"
+}
+
+function dm_copy() {
+	[[ -z "${DMCOPY}" ]] && return 0
+	
+	tar -C ${DM_PATH} -cf - ${DMDEVICE} |  tar -C ${DMCOPY} -xf - \
+		|| error "dm_copy: failed to copy device"
+	DMCOPY_DONE="yes"
+}
+
+function run_fsck() {
+	local fsck_out=""
+	fsck_out="$(fsck -p "${DM_PATH}/${DMDEVICE}")"
+	local ret=$?
+	if [[ $ret -ne 0 && $ret -ne 1 ]]; then
+		warn "first fsck failed on ${DM_PATH}/${DMDEVICE}"
+		echo "${fsck_out}" | while read line; do
+			warn "first fsck output: $line"
+		done
+		fsck_out="$(fsck -y "${DM_PATH}/${DMDEVICE}")"
+		local ret=$?
+		if [[ $ret -ne 0 && $ret -ne 1 ]]; then
+			warn "second fsck failed on ${DM_PATH}/${DMDEVICE}"
+			echo "${fsck_out}" | while read line; do
+				warn "second fsck output: $line"
+			done
+			error "aborting because of failed fsck"
+		fi
+	fi
+}
+
+function do_fsck() {
+	local chk=""
+	local pid=""
+	chk="$(test_fsck "${DM_PATH}/${DMDEVICE}")"
+	if [[ -n "${chk}" ]]; then
+		local title="Veuillez patienter"
+		local msg="Veuillez patienter - verification d'integrite des partitions utilisateur en cours"
+		XAUTHORITY="/var/run/authdir/slim.auth" DISPLAY=:0 "${XDIALOG}" \
+			--wrap --left --no-buttons --no-cancel --no-ok --title "${title}" \
+			--msgbox "${msg}" 0 0 &
+		pid=$!
+	fi
+	run_fsck # Run fsck even if it is not detected as needed, in case I missed something in test_fsck
+	if [[ -n "${pid}" ]]; then
+		kill ${pid}
+		kill -9 ${pid} 2>/dev/null
+	fi
+}
+
+function do_mount() {
+	do_fsck
+	[[ "${DO_MKDIR}" == "1" ]] && do_mkdir
+	local mtabfile="${MTAB_PATH}/${LEVEL}.mtab"
+	case "${LEVEL}" in
+		rm_*)
+			DMCOPY="/mounts/vsdev/${LEVEL}/jail_devs/mapper"
+			;;
+		user|admin|audit|update)	
+			DMCOPY="/mounts/${LEVEL}_priv/dev/mapper"
+			;;
+		clip)
+			DMCOPY=""
+			;;
+		*)
+			error "Unsupported level ${LEVEL}"
+			;;
+	esac
+	dm_copy
+	local mtabstr="${DM_PATH}/${DMDEVICE} ${DEST} ext2,ext4 ${OPTS}"
+	if [[ "${LEVEL}" == "clip" ]]; then
+		mount -n -o "${OPTS}" -t ext2,ext4 "${DM_PATH}/${DMDEVICE}" \
+			"${DEST}" || error "mount failed"
+		# argh, we cannot specify an alternate mtab for mount... 
+		# We will need to do the update in a non-atomic way...
+		flock "${mtabfile}" echo "${mtabstr} crypt" >> "${mtabfile}" \
+			|| error "failed to update mtab"
+	else
+		# requires vsctl >= 1.3.4
+		nsmount -m "${mtabfile}" -x "${XID}" -o "${OPTS}" -t ext2,ext4 \
+				"${DM_PATH}/${DMDEVICE}" "${DEST}" \
+			|| error "nsmount failed"
+		# Add specific marker to show this is an encrypted mount
+		flock "${mtabfile}" sed -i -e \
+				"s|${mtabstr}|${mtabstr} crypt|" "${mtabfile}" \
+			|| error "failed to mark mtab line ${mtabstr}"
+		rm -f "${DMCOPY}/${DMDEVICE}" \
+			|| error "could not remove ${DMCOPY}/${DMDEVICE}"
+	fi
+}
+		
+
+LEVEL="${1}"
+LINE="${2}"
+common_init "passwd"
+get_xid "${LEVEL}"
+
+init
+read_fstab "${LINE}"
+do_losetup
+decrypt_key
+do_cryptsetup
+do_mount
+log "mounted ${DEST} in ${LEVEL}"

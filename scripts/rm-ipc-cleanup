@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+source "/etc/conf.d/clip"
+
+for jail in ${CLIP_JAILS}; do
+	ctx="$(< "/etc/jails/${jail}/context")"
+	[[ -n "${ctx}" ]] || continue
+
+	vspace -i "${ctx}" /usr/bin/ipc-cleanup \
+		|| logger -p local0.warning "Failed to run ipc-cleanup in jail ${jail}"
+done
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+ipcs -m | awk '$1 ~ /0x/ && $3 != "root" {print $2}' \
+	| while read k; do ipcrm -m "${k}"; done
+
+ipcs -s | awk '$1 ~ /0x/ && $3 != "root" {print $2}' \
+	| while read k; do ipcrm -s "${k}"; done
+
+ipcs -q | awk '$1 ~ /0x/ && $3 != "root" {print $2}' \
+	| while read k; do ipcrm -q "${k}"; done
+
+exit 0
+

@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+source "/etc/conf.d/clip"
+
+for jail in ${CLIP_JAILS}; do
+	vsctl "${jail}" enter -c /user -- /bin/mkdir -p -m 1777 /home/user/.vartmp \
+		|| logger -p local0.warning "Failed to created /home/user/.vartmp in ${jail}"
+	if [[ -f "/mounts/xauth/${jail}/xauthority" ]]; then
+		rm -f "/mounts/xauth/${jail}/xauthority"
+	fi
+done
+exit 0

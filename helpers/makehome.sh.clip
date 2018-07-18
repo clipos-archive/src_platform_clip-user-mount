@@ -1,0 +1,223 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+# Makehome.sh: Create a user's encrypted home for CLIP
+
+# Copyright (C) 2006 SGDN/DCSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License 
+# version 2 as published by the Free Software Foundation.
+
+source /lib/clip/userkeys.sub
+source /etc/conf.d/clip
+
+AUDIT_SSH=/home/auditclip/.ssh
+AUDIT_PUBKEYS="${AUDIT_SSH}"/authorized_keys
+ADMIN_SSH=/home/adminclip/.ssh
+ADMIN_PUBKEYS="${ADMIN_SSH}"/authorized_keys
+RM_ADMIN_BASE=/home/admin # +jailname
+SRC_DEVICE="/dev/urandom"
+genkey=""
+
+cleanup() {
+	umount "$NAME"
+	cryptsetup remove "$NAME"
+	losetup -d /dev/loop7
+}
+
+SIZE=16
+
+pushd /home 1>/dev/null
+if [[ $? -ne 0 ]]; then
+	echo "Could not cd to /home" >&2
+	exit 1
+fi
+
+while getopts zkp:P:t:j:s: arg ; do
+	case $arg in
+		z)
+			SRC_DEVICE="/dev/zero"
+			;;
+		p)	
+			PASSWD="$OPTARG"
+			;;
+		t)
+			TYPE="$OPTARG"
+			;;
+		s)
+			SIZE="$OPTARG"
+			;;
+		*)
+			echo "Invalid argument" >&2
+			exit 1;
+			;;
+	esac
+done
+shift `expr $OPTIND - 1`
+echo "args $*, opting $OPTIND"
+
+NAME=$1
+
+if [[ $# < 1 ]] ; then
+	echo "Not enough args"
+	exit 1
+fi
+
+CRYPT_FILE="$NAME.part"
+KEY_FILE="$NAME.key"
+SETTINGS_FILE="$NAME.settings"
+
+gen_part() {
+	local prefix=$1
+	local genkey=$2
+	local hostkey=$3
+
+	if [ -z "${prefix}" ]; then
+		echo "Prefix not set" > /dev/stderr
+		return 1
+	fi
+
+	echo "Creating part and key for $prefix"
+
+	create_settings "${NAME}" "${SETTINGS_FILE}"
+	if [[ $? -ne 0 ]]; then
+		echo "Create settings failed" > /dev/stderr
+		return 1
+	fi
+	KEY=`tr -cd [:graph:] < /dev/urandom | head -c 119`
+	echo -n "${KEY}" |\
+		PASS="${PASSWD}" encrypt_stage2_key "${SETTINGS_FILE}" \
+			"PASS" "${KEY_FILE}" 
+	if [[ $? -ne 0 ]]; then
+		echo "Key encryption failed" > /dev/stderr
+		return 1
+	fi
+
+	dd if="${SRC_DEVICE}" of="$CRYPT_FILE" bs=1M count="$SIZE" 1>/dev/null 2>/dev/null \
+		|| echo "dd failed" >&2
+	losetup /dev/loop7 "$CRYPT_FILE"
+
+
+	echo -n "${KEY}" | cryptsetup create -c aes-lrw-benbi \
+				-s 384 -h sha256 "$NAME" /dev/loop7
+
+	if [ ! -e "/dev/mapper/$NAME" ] ; then
+		echo "cryptsetup error" 
+		exit 1
+	fi
+
+	mke2fs "/dev/mapper/$NAME" 1>/dev/null 2>/dev/null
+
+	mkdir -p "$NAME"
+	echo "Mounting for chmod"
+	mount "/dev/mapper/$NAME" "$NAME"
+	chown "$NAME" "$NAME"
+	chmod 700 "$NAME"
+
+	if [[ -n "${genkey}" ]]; then
+		mkdir "${NAME}/.ssh"
+		chown "${NAME}" "${NAME}/.ssh"
+		su "${NAME}" -c "/usr/local/bin/ssh-keygen -t rsa -N '' -b 2048 -f ${NAME}/.ssh/id_rsa"
+		chmod 400 "${NAME}/.ssh"/*
+		cp "${NAME}/.ssh/id_rsa.pub" .
+	fi
+	if [[ -n "${hostkey}" ]]; then
+		echo -n "127.0.0.1 " > "${NAME}/.ssh/known_hosts"
+		awk '{print $1" "$2}' "${hostkey}" >> "${NAME}/.ssh/known_hosts"
+		chown "${NAME}" "${NAME}/.ssh/known_hosts"
+	fi
+
+	cleanup
+	chown root:root "$CRYPT_FILE" "$KEY_FILE"
+	chmod 600 "$CRYPT_FILE" "$KEY_FILE"
+	mkdir -p "${prefix}/parts" "${prefix}/keys"
+	mv "$CRYPT_FILE" "$prefix/parts/"
+	mv "$KEY_FILE" "$prefix/keys/"
+	mv "$SETTINGS_FILE" "$prefix/keys/"	
+	rmdir "$NAME"
+
+	echo "... Part created"
+}
+
+setup_pubkey() {
+	local keyfile=$1
+	local keydir=`/usr/bin/dirname "${keyfile}"`
+
+	[[ -e "${keyfile}" ]] && return 0
+
+	/bin/mkdir -p "${keydir}"
+	/bin/touch "${keyfile}"
+	/bin/chown -R 0:0 "${keydir}"
+	/bin/chmod 755 "${keydir}"
+	/bin/chmod 644 "${keyfile}"
+}
+
+move_key() {
+	local type="$1"
+	local jail="$2"
+
+	case "${TYPE}" in
+		admin)
+			if [ -n "${jail}" ]; then
+				echo "-j is incompatible with admin type" > /dev/stderr
+				rm id_rsa.pub
+				return 1
+			fi
+			setup_pubkey "${ADMIN_PUBKEYS}"
+			cat id_rsa.pub >> ${ADMIN_PUBKEYS}
+			;;
+		audit)
+			if [ -n "${jail}" ]; then
+				echo "-j is incompatible with audit type" > /dev/stderr
+				rm id_rsa.pub
+				return 1
+			fi
+			setup_pubkey "${AUDIT_PUBKEYS}"
+			cat id_rsa.pub >> ${AUDIT_PUBKEYS}
+			;;
+		*)
+			echo "Unsupported type ${TYPE}" > /dev/stderr
+			rm id_rsa.pub
+			return 1
+			;;
+	esac
+	rm -f id_rsa.pub
+}
+
+echo -n "Creating core part "
+
+case "${TYPE}" in
+	admin)
+		echo "with type ${TYPE}"
+		gen_part . y "/mounts/admin_root/etc/ssh/ssh_host_rsa_key.pub"
+		move_key "${TYPE}"
+		;;
+	audit)
+		echo "with type ${TYPE}"
+		gen_part . y "/mounts/audit_root/etc/ssh/ssh_host_rsa_key.pub"
+		move_key "${TYPE}"
+		;;
+	*)
+		echo "with default type"
+		gen_part .
+		;;
+esac
+
+for _jail in ${CLIP_JAILS}; do
+	echo -n "Creating part for ${_jail} "
+	case "${TYPE}" in
+		admin|audit)
+			echo ": no part for type ${TYPE}"
+			;;
+		*)
+			echo "with default type"
+			gen_part "${_jail}"
+			;;
+	esac
+done
+
+echo "All clear"
+popd 1>/dev/null

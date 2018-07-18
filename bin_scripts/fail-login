@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+logger -p auth.err "Blocked login from user ${USER}"
+exit 1
